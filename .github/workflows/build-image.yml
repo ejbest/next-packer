@@ -1,4 +1,4 @@
-name: Build & Upload MAAS Image
+name: Build Available MAAS Image
 
 # Run this ONCE when the base image needs to be updated.
 # Builds Ubuntu 24.04 with Docker + Libvirt pre-installed via Packer,
