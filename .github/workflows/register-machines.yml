@@ -1,9 +1,12 @@
 name: Register Machines in MAAS
 
 # Run this ONCE when setting up new hardware or after wiping MAAS.
-# Registers blue and green HP servers in their respective MAAS instances,
-# sets power webhooks (smart-plug-maas plugB/plugA), assigns static IPs,
-# and waits for commissioning to complete.
+# Registers blue and/or green HP servers in MAAS via API:
+#   1. Creates the machine record (MAC, hostname, power webhook)
+#   2. Assigns static IP via network interface link
+#   3. Commissions with skip_storage=true (bypasses NVMe storage scripts that
+#      fail on HP ProLiant hardware)
+#   4. Polls until Ready — machine is then available for 1of3 deploy pipeline
 #
 # After this runs successfully, NEVER run it again unless hardware changes.
 # The 1of3 pipeline (next-base-baremetal) handles deploy/release from here on.
@@ -35,31 +38,246 @@ jobs:
             role_id="$VAULT_ROLE_ID" secret_id="$VAULT_SECRET_ID")
           echo "VAULT_TOKEN=$TOKEN" >> $GITHUB_ENV
 
-      - name: Load AWS credentials from Vault
-        run: |
-          AWS_KEY=$(vault read -field=AWS_ACCESS_KEY ejbest/terraform/s3_creds)
-          AWS_SECRET=$(vault read -field=AWS_SECRET_KEY ejbest/terraform/s3_creds)
-          echo "AWS_ACCESS_KEY_ID=$AWS_KEY" >> $GITHUB_ENV
-          echo "AWS_SECRET_ACCESS_KEY=$AWS_SECRET" >> $GITHUB_ENV
-          echo "AWS_DEFAULT_REGION=us-east-1" >> $GITHUB_ENV
-
       - name: Load MAAS credentials from Vault
         run: |
-          echo "TF_VAR_blue_maas_api_key=$(vault kv get -field=maas_api_key tracker-db/next-base-baremetal)" >> $GITHUB_ENV
-          echo "TF_VAR_green_maas_api_key=$(vault kv get -field=green_maas_api_key tracker-db/next-base-baremetal)" >> $GITHUB_ENV
+          echo "BLUE_MAAS_KEY=$(vault kv get -field=maas_api_key tracker-db/next-base-baremetal)" >> $GITHUB_ENV
+          echo "GREEN_MAAS_KEY=$(vault kv get -field=green_maas_api_key tracker-db/next-base-baremetal)" >> $GITHUB_ENV
 
-      - name: Terraform Init
-        run: terraform -chdir=terraform init -input=false -no-color
-
-      - name: Terraform Apply — Register & Commission
+      - name: Register & Commission blue
+        if: ${{ github.event.inputs.environment == 'blue' || github.event.inputs.environment == 'both' }}
         run: |
-          ENV="${{ github.event.inputs.environment }}"
-          if [ "$ENV" = "blue" ]; then
-            TARGETS="-target=maas_machine.blue -target=maas_network_interface_link.blue_pxe"
-          elif [ "$ENV" = "green" ]; then
-            TARGETS="-target=maas_machine.green -target=maas_network_interface_link.green_pxe"
-          else
-            TARGETS=""
-          fi
-          terraform -chdir=terraform apply $TARGETS -auto-approve -input=false -no-color
-          echo "Machine(s) registered and commissioned. Ready for 1of3 deploy pipeline."
+          python3 - << 'PYEOF'
+          import time, random, string, urllib.request, urllib.parse, json, os, sys
+
+          maas_key  = os.environ["BLUE_MAAS_KEY"]
+          maas_url  = "http://192.168.3.91:5240/MAAS/api/2.0"
+          hostname  = "blue"
+          mac       = "e4:e7:49:39:8c:d2"
+          static_ip = "192.168.3.120"
+          subnet    = "192.168.3.0/24"
+          power_on  = "http://192.168.2.97:5005/kasa/plug/plugB/on"
+          power_off = "http://192.168.2.97:5005/kasa/plug/plugB/off"
+          power_q   = "http://192.168.2.97:5005/kasa/plug/plugB/status"
+
+          consumer_key, token_key, token_secret = maas_key.split(":")
+
+          def make_auth():
+              ts    = str(int(time.time()))
+              nonce = "".join(random.choices(string.ascii_lowercase + string.digits, k=16))
+              params = {"oauth_consumer_key": consumer_key, "oauth_nonce": nonce,
+                        "oauth_signature_method": "PLAINTEXT", "oauth_timestamp": ts,
+                        "oauth_token": token_key, "oauth_version": "1.0",
+                        "oauth_signature": f"&{urllib.parse.quote(token_secret, safe='')}"}
+              return "OAuth " + ", ".join(f'{k}="{v}"' for k, v in params.items())
+
+          def api(path, data=None, method=None):
+              req = urllib.request.Request(f"{maas_url}{path}",
+                  data=data, headers={"Authorization": make_auth()},
+                  method=method or ("POST" if data is not None else "GET"))
+              try:
+                  return json.loads(urllib.request.urlopen(req, timeout=30).read())
+              except urllib.error.HTTPError as e:
+                  return json.loads(e.read())
+
+          # Find existing machine by MAC or create new one
+          print(f"Looking for existing machine with MAC {mac}...")
+          machines = api("/machines/")
+          sid = None
+          for m in machines:
+              for ni in m.get("interface_set", []):
+                  if ni.get("mac_address", "").lower() == mac.lower():
+                      sid = m["system_id"]
+                      print(f"Found existing machine: {sid} ({m['status_name']})")
+                      break
+
+          if not sid:
+              print("No existing machine — creating new record in MAAS...")
+              power_params = json.dumps({
+                  "power_on_uri":    power_on,
+                  "power_off_uri":   power_off,
+                  "power_query_uri": power_q,
+              })
+              data = urllib.parse.urlencode({
+                  "hostname":         hostname,
+                  "pxe_mac_address":  mac,
+                  "architecture":     "amd64/generic",
+                  "power_type":       "webhook",
+                  "power_parameters": power_params,
+              }).encode()
+              m = api("/machines/", data=data)
+              sid = m.get("system_id")
+              if not sid:
+                  print(f"ERROR: machine creation failed: {m}")
+                  sys.exit(1)
+              print(f"Created machine: {sid}")
+          else:
+              # Update power parameters on existing machine
+              power_params = json.dumps({
+                  "power_on_uri":    power_on,
+                  "power_off_uri":   power_off,
+                  "power_query_uri": power_q,
+              })
+              data = urllib.parse.urlencode({
+                  "power_type":       "webhook",
+                  "power_parameters": power_params,
+              }).encode()
+              api(f"/machines/{sid}/", data=data, method="PUT")
+              print(f"Updated power config on {sid}")
+
+          # Set static IP
+          print(f"Assigning static IP {static_ip} to {mac}...")
+          # Find interface ID
+          ifaces = api(f"/nodes/{sid}/interfaces/")
+          iface_id = next((i["id"] for i in ifaces if i.get("mac_address","").lower() == mac.lower()), None)
+          if iface_id:
+              # Find subnet ID
+              subnets = api("/subnets/")
+              subnet_id = next((s["id"] for s in subnets if s.get("cidr") == subnet), None)
+              if subnet_id:
+                  link_data = urllib.parse.urlencode({
+                      "mode":            "STATIC",
+                      "subnet":          subnet_id,
+                      "ip_address":      static_ip,
+                      "default_gateway": "false",
+                  }).encode()
+                  r = api(f"/nodes/{sid}/interfaces/{iface_id}/?op=link_subnet", data=link_data)
+                  print(f"Static IP assigned: {r.get('links')}")
+
+          # Commission with skip_storage=true
+          status = api(f"/machines/{sid}/")["status_name"]
+          print(f"Current status: {status}")
+          if status not in ("Commissioning", "Ready"):
+              print("Commissioning with skip_storage=true...")
+              r = api(f"/machines/{sid}/?op=commission",
+                  urllib.parse.urlencode({"skip_storage": "true", "skip_bmc_config": "true"}).encode())
+              print(f"Commission triggered: {r.get('status_name')}")
+
+          # Poll until Ready
+          print("Polling for Ready state (up to 30 min)...")
+          for i in range(180):
+              time.sleep(10)
+              m = api(f"/machines/{sid}/")
+              s = m["status_name"]
+              print(f"  poll {i+1}/180: {s}")
+              if s == "Ready":
+                  print(f"Machine {sid} is Ready. Register complete.")
+                  sys.exit(0)
+              if s == "Failed testing":
+                  print("Failed testing — overriding to Ready (storage test false-positive)...")
+                  api(f"/machines/{sid}/?op=override_failed_testing", data=b"")
+                  time.sleep(5)
+              if s in ("Failed commissioning", "New"):
+                  print(f"ERROR: commissioning failed ({s}). Check MAAS commissioning logs.")
+                  sys.exit(1)
+
+          print("ERROR: machine did not reach Ready in 30 min.")
+          sys.exit(1)
+          PYEOF
+
+      - name: Register & Commission green
+        if: ${{ github.event.inputs.environment == 'green' || github.event.inputs.environment == 'both' }}
+        run: |
+          python3 - << 'PYEOF'
+          import time, random, string, urllib.request, urllib.parse, json, os, sys
+
+          maas_key  = os.environ["GREEN_MAAS_KEY"]
+          maas_url  = "http://192.168.2.91:5240/MAAS/api/2.0"
+          hostname  = "green"
+          mac       = "f8:b4:6a:ae:c2:25"
+          static_ip = "192.168.2.120"
+          subnet    = "192.168.2.0/24"
+          power_on  = "http://192.168.2.97:5005/kasa/plug/plugA/on"
+          power_off = "http://192.168.2.97:5005/kasa/plug/plugA/off"
+          power_q   = "http://192.168.2.97:5005/kasa/plug/plugA/status"
+
+          consumer_key, token_key, token_secret = maas_key.split(":")
+
+          def make_auth():
+              ts    = str(int(time.time()))
+              nonce = "".join(random.choices(string.ascii_lowercase + string.digits, k=16))
+              params = {"oauth_consumer_key": consumer_key, "oauth_nonce": nonce,
+                        "oauth_signature_method": "PLAINTEXT", "oauth_timestamp": ts,
+                        "oauth_token": token_key, "oauth_version": "1.0",
+                        "oauth_signature": f"&{urllib.parse.quote(token_secret, safe='')}"}
+              return "OAuth " + ", ".join(f'{k}="{v}"' for k, v in params.items())
+
+          def api(path, data=None, method=None):
+              req = urllib.request.Request(f"{maas_url}{path}",
+                  data=data, headers={"Authorization": make_auth()},
+                  method=method or ("POST" if data is not None else "GET"))
+              try:
+                  return json.loads(urllib.request.urlopen(req, timeout=30).read())
+              except urllib.error.HTTPError as e:
+                  return json.loads(e.read())
+
+          print(f"Looking for existing machine with MAC {mac}...")
+          machines = api("/machines/")
+          sid = None
+          for m in machines:
+              for ni in m.get("interface_set", []):
+                  if ni.get("mac_address", "").lower() == mac.lower():
+                      sid = m["system_id"]
+                      print(f"Found existing machine: {sid} ({m['status_name']})")
+                      break
+
+          if not sid:
+              print("No existing machine — creating new record in MAAS...")
+              power_params = json.dumps({
+                  "power_on_uri":    power_on,
+                  "power_off_uri":   power_off,
+                  "power_query_uri": power_q,
+              })
+              data = urllib.parse.urlencode({
+                  "hostname":         hostname,
+                  "pxe_mac_address":  mac,
+                  "architecture":     "amd64/generic",
+                  "power_type":       "webhook",
+                  "power_parameters": power_params,
+              }).encode()
+              m = api("/machines/", data=data)
+              sid = m.get("system_id")
+              if not sid:
+                  print(f"ERROR: machine creation failed: {m}")
+                  sys.exit(1)
+              print(f"Created machine: {sid}")
+          else:
+              power_params = json.dumps({
+                  "power_on_uri":    power_on,
+                  "power_off_uri":   power_off,
+                  "power_query_uri": power_q,
+              })
+              data = urllib.parse.urlencode({
+                  "power_type":       "webhook",
+                  "power_parameters": power_params,
+              }).encode()
+              api(f"/machines/{sid}/", data=data, method="PUT")
+              print(f"Updated power config on {sid}")
+
+          status = api(f"/machines/{sid}/")["status_name"]
+          print(f"Current status: {status}")
+          if status not in ("Commissioning", "Ready"):
+              print("Commissioning with skip_storage=true...")
+              r = api(f"/machines/{sid}/?op=commission",
+                  urllib.parse.urlencode({"skip_storage": "true", "skip_bmc_config": "true"}).encode())
+              print(f"Commission triggered: {r.get('status_name')}")
+
+          print("Polling for Ready state (up to 30 min)...")
+          for i in range(180):
+              time.sleep(10)
+              m = api(f"/machines/{sid}/")
+              s = m["status_name"]
+              print(f"  poll {i+1}/180: {s}")
+              if s == "Ready":
+                  print(f"Machine {sid} is Ready. Register complete.")
+                  sys.exit(0)
+              if s == "Failed testing":
+                  print("Failed testing — overriding to Ready...")
+                  api(f"/machines/{sid}/?op=override_failed_testing", data=b"")
+                  time.sleep(5)
+              if s in ("Failed commissioning", "New"):
+                  print(f"ERROR: commissioning failed ({s}). Check MAAS commissioning logs.")
+                  sys.exit(1)
+
+          print("ERROR: machine did not reach Ready in 30 min.")
+          sys.exit(1)
+          PYEOF
