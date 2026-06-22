@@ -1,0 +1,79 @@
+name: Build & Upload MAAS Image
+
+# Run this ONCE when the base image needs to be updated.
+# Builds Ubuntu 24.04 with Docker + Libvirt pre-installed via Packer,
+# then uploads to MAAS as custom/ubuntu-24.04-libvirt-host.
+# Do NOT trigger on every rebuild — this is a one-time or on-demand operation.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Which MAAS to upload the image to'
+        required: true
+        type: choice
+        options: [blue, green, both]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
+jobs:
+  build-and-upload:
+    name: Build Packer Image & Upload to MAAS (${{ github.event.inputs.environment }})
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.2
+
+      - name: Vault Login (AppRole)
+        run: |
+          TOKEN=$(vault write -field=token auth/approle/login \
+            role_id="$VAULT_ROLE_ID" secret_id="$VAULT_SECRET_ID")
+          echo "VAULT_TOKEN=$TOKEN" >> $GITHUB_ENV
+
+      - name: Load MAAS credentials from Vault
+        run: |
+          if [[ "${{ github.event.inputs.environment }}" == "blue" || "${{ github.event.inputs.environment }}" == "both" ]]; then
+            KEY=$(vault kv get -field=maas_api_key tracker-db/next-base-baremetal)
+            echo "BLUE_MAAS_API_KEY=$KEY" >> $GITHUB_ENV
+            echo "BLUE_MAAS_API_URL=http://192.168.3.91:5240/MAAS" >> $GITHUB_ENV
+          fi
+          if [[ "${{ github.event.inputs.environment }}" == "green" || "${{ github.event.inputs.environment }}" == "both" ]]; then
+            KEY=$(vault kv get -field=green_maas_api_key tracker-db/next-base-baremetal)
+            echo "GREEN_MAAS_API_KEY=$KEY" >> $GITHUB_ENV
+            echo "GREEN_MAAS_API_URL=http://192.168.2.91:5240/MAAS" >> $GITHUB_ENV
+          fi
+
+      - name: Build Packer image
+        run: |
+          cd packer
+          chmod +x build.sh
+          # build.sh handles deps, Packer build, and produces custom-cloudimg.tar.gz
+          # Skip upload step here — we upload per-MAAS below
+          SKIP_UPLOAD=true bash build.sh
+          echo "IMAGE_PATH=$(pwd)/packer-maas/ubuntu/custom-cloudimg.tar.gz" >> $GITHUB_ENV
+
+      - name: Upload to blue MAAS
+        if: ${{ github.event.inputs.environment == 'blue' || github.event.inputs.environment == 'both' }}
+        run: |
+          curl -s -X POST "${BLUE_MAAS_API_URL}/api/2.0/boot-resources/" \
+            -H "Authorization: OAuth ${BLUE_MAAS_API_KEY}" \
+            -F "name=custom/ubuntu-24.04-libvirt-host" \
+            -F "title=Ubuntu 24.04 (Noble) - Libvirt/Docker Pre-baked" \
+            -F "architecture=amd64/generic" \
+            -F "filetype=tgz" \
+            -F "content=@${IMAGE_PATH}"
+          echo "Uploaded to blue MAAS."
+
+      - name: Upload to green MAAS
+        if: ${{ github.event.inputs.environment == 'green' || github.event.inputs.environment == 'both' }}
+        run: |
+          curl -s -X POST "${GREEN_MAAS_API_URL}/api/2.0/boot-resources/" \
+            -H "Authorization: OAuth ${GREEN_MAAS_API_KEY}" \
+            -F "name=custom/ubuntu-24.04-libvirt-host" \
+            -F "title=Ubuntu 24.04 (Noble) - Libvirt/Docker Pre-baked" \
+            -F "architecture=amd64/generic" \
+            -F "filetype=tgz" \
+            -F "content=@${IMAGE_PATH}"
+          echo "Uploaded to green MAAS."
