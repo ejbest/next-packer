@@ -40,7 +40,14 @@ apt-get install -y \
     qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils \
     virtinst cpu-checker qemu-efi-aarch64 qemu-system-arm \
     docker.io docker-compose-v2 \
-    linux-generic grub-efi-amd64
+    linux-generic grub-efi-amd64 \
+    cockpit cockpit-machines
+
+# Pre-bake Ubuntu 24.04 cloud image at / so cloud-init skips the internet download.
+# create-vm.sh in next-base-libvirt will move it to /vms/ on first VM creation.
+wget -q --show-progress -O /ubuntu-24.04-server-cloudimg-amd64.img \
+    "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img" || \
+    echo "Warning: cloud image pre-bake failed — will download at deploy time instead"
 EOF
 chmod +x customize.sh
 
