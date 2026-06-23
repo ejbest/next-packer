@@ -149,7 +149,7 @@ jobs:
           if status not in ("Commissioning", "Ready"):
               print("Commissioning with skip_storage=true...")
               r = api(f"/machines/{sid}/?op=commission",
-                  urllib.parse.urlencode({"skip_storage": "true", "skip_bmc_config": "true"}).encode())
+                  urllib.parse.urlencode({"skip_storage": "true", "skip_bmc_config": "true", "skip_networking": "true"}).encode())
               print(f"Commission triggered: {r.get('status_name')}")
 
           # Poll until Ready
@@ -258,7 +258,7 @@ jobs:
           if status not in ("Commissioning", "Ready"):
               print("Commissioning with skip_storage=true...")
               r = api(f"/machines/{sid}/?op=commission",
-                  urllib.parse.urlencode({"skip_storage": "true", "skip_bmc_config": "true"}).encode())
+                  urllib.parse.urlencode({"skip_storage": "true", "skip_bmc_config": "true", "skip_networking": "true"}).encode())
               print(f"Commission triggered: {r.get('status_name')}")
 
           print("Polling for Ready state (up to 30 min)...")
